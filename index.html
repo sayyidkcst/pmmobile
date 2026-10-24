@@ -749,6 +749,8 @@
             </div>
         </div>
 
+
+
         <div class="enquiry-section">
             <span class="enquiry-label"><i class="fas fa-headset"></i> Need help? Contact us:</span>
             <a href="https://wa.me/919744705652" target="_blank" class="btn-enquiry-wa">
@@ -859,6 +861,9 @@
                 <i class="fas fa-certificate" style="margin-left: 8px; opacity: 0.9;"></i>
             </div>
         </div>
+
+
+
         <div class="enquiry-section">
             <span class="enquiry-label"><i class="fas fa-headset"></i> Need help? Contact us:</span>
             <a href="https://wa.me/919744705652" target="_blank" class="btn-enquiry-wa">
@@ -1392,6 +1397,7 @@
             document.getElementById('navBadgeMobile').style.display = totalQty > 0 ? 'flex' : 'none';
             renderCartDesktop();
             renderCartMobile();
+            if (window.pmCartChanged) window.pmCartChanged();
         }
 
         // ==========================================
@@ -1601,13 +1607,45 @@
         }
         function rowToUser(r) {
             return {
-                id: r.id, phone: r.phone, created_at: r.created_at,
+                id: r.id, phone: r.phone, created_at: r.created_at, cart: r.cart,
                 user_metadata: { full_name: r.name || '', phone: r.phone || '', address: r.address || '', avatar_url: r.avatar_url || '' }
             };
         }
         function saveSession() {
             try { if (currentUser) localStorage.setItem(SESSION_KEY, JSON.stringify(currentUser)); else localStorage.removeItem(SESSION_KEY); } catch (e) {}
         }
+        // ----- cart saved in the database (per account) -----
+        let cartRestoring = false;
+        let cartSaveTimer = null;
+        window.pmCartChanged = function() {
+            if (!currentUser || cartRestoring) return;
+            clearTimeout(cartSaveTimer);
+            cartSaveTimer = setTimeout(async () => {
+                if (!currentUser) return;
+                const items = cart.map(i => ({ size: i.size, price: i.price, qty: i.qty, name: i.name }));
+                const { error } = await supabaseClient.from('customers').update({ cart: items }).eq('id', currentUser.id);
+                if (error) console.warn('Cart save error (run pm_accounts_setup.sql to add the cart column):', error.message);
+            }, 600);
+        };
+        // after login: show the saved cart, merged with anything added before logging in
+        function applySavedCart(saved) {
+            if (!Array.isArray(saved)) saved = [];
+            const merged = saved
+                .filter(i => i && i.size && Number(i.qty) > 0)
+                .map(i => ({ size: i.size, price: Number(i.price) || 0, qty: Number(i.qty), name: i.name }));
+            let guestItems = false;
+            cart.forEach(g => {
+                guestItems = true;
+                const e = merged.find(m => m.size === g.size);
+                if (e) e.qty += g.qty; else merged.push({ size: g.size, price: g.price, qty: g.qty, name: g.name });
+            });
+            cartRestoring = true;
+            cart = merged;
+            updateCartUI();
+            cartRestoring = false;
+            if (guestItems) window.pmCartChanged();
+        }
+
         // update the customer's row and keep currentUser in step
         async function updateCustomer(fields) {
             if (!currentUser) return { error: { message: 'not logged in' } };
@@ -1742,6 +1780,7 @@
                 }
                 currentUser = signedUser;
                 saveSession();
+                applySavedCart(signedUser.cart);
                 refreshAccountUI();
                 document.getElementById('authPassword').value = '';
                 const next = afterLoginCheckout;
@@ -1756,8 +1795,11 @@
         }
 
         async function logoutUser() {
+            clearTimeout(cartSaveTimer);
             currentUser = null;
             saveSession();
+            cart = [];
+            updateCartUI();
             refreshAccountUI();
             closeAccountPage();
             showToast('Logged out', 'info');
@@ -2098,9 +2140,12 @@
                 if (!saved || !saved.id) return;
                 currentUser = saved;
                 refreshAccountUI();
-                const { data, error } = await supabaseClient.from('customers').select('*').eq('id', saved.id).limit(1);
+                cartRestoring = true; // don't overwrite the saved cart before it has loaded
+                let data, error;
+                try { ({ data, error } = await supabaseClient.from('customers').select('*').eq('id', saved.id).limit(1)); }
+                finally { cartRestoring = false; }
                 if (!error) {
-                    if (data && data.length) { currentUser = rowToUser(data[0]); saveSession(); }
+                    if (data && data.length) { currentUser = rowToUser(data[0]); saveSession(); applySavedCart(currentUser.cart); }
                     else { currentUser = null; saveSession(); closeAccountPage(); }
                     refreshAccountUI();
                 }
@@ -2215,14 +2260,15 @@
                 // link the order to the logged-in account (needs a user_id column); retry without it if the column is missing
                 let { data, error } = await supabaseClient.from('orders')
                     .insert([{ ...orderRow, user_id: currentUser ? currentUser.id : null }]);
-                if (error && /user_id/i.test(error.message || '')) {
+                if (error && currentUser) {
+                    // retry without the account link (column/constraint on user_id may not match)
                     ({ data, error } = await supabaseClient.from('orders').insert([orderRow]));
                 }
 
                 if (error) {
                     console.error('❌ Error saving order:', error);
                     if (waWindow) waWindow.close();
-                    showToast('Error placing order. Please try again.', 'error');
+                    showToast('Error placing order: ' + String(error.message || 'please try again').slice(0, 120), 'error');
                     return;
                 }
                 console.log('✅ Order saved to database:', data);
